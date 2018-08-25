@@ -24,7 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	mapset "github.com/deckarep/golang-set"
+	"github.com/deckarep/golang-set"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
@@ -35,6 +35,8 @@ import (
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"encoding/json"
+	"github.com/ethereum/go-ethereum/consensus/dpos"
 )
 
 const (
@@ -166,6 +168,7 @@ type worker struct {
 }
 
 func newWorker(config *params.ChainConfig, engine consensus.Engine, eth Backend, mux *event.TypeMux, recommit time.Duration) *worker {
+	log.Info("执行 newWorker() 方法")
 	worker := &worker{
 		config:             config,
 		engine:             engine,
@@ -196,14 +199,16 @@ func newWorker(config *params.ChainConfig, engine consensus.Engine, eth Backend,
 		log.Warn("Sanitizing miner recommit interval", "provided", recommit, "updated", minRecommitInterval)
 		recommit = minRecommitInterval
 	}
+	log.Info("newWorker()方法中", "minRecommitInterval", minRecommitInterval)
 
-	go worker.mainLoop()
+	//go worker.dposWorkLoop()
 	go worker.newWorkLoop(recommit)
+	go worker.mainLoop()
 	go worker.resultLoop()
 	go worker.taskLoop()
 
 	// Submit first work to initialize pending state.
-	worker.startCh <- struct{}{}
+	//worker.startCh <- struct{}{}
 
 	return worker
 }
@@ -276,8 +281,41 @@ func (w *worker) close() {
 	}
 }
 
+func (w *worker) dposWorkLoop() {
+	var (
+		defaultDur          = 2 * time.Second
+		timer               = time.NewTimer(defaultDur)
+	)
+	var interrupt *int32
+	if (interrupt != nil) {
+		atomic.StoreInt32(interrupt, 1)
+	}
+
+	commit := func(noempty bool, s int32) {
+		if interrupt != nil {
+			atomic.StoreInt32(interrupt, s)
+		}
+		interrupt = new(int32)
+		w.newWorkCh <- &newWorkReq{interrupt: interrupt, noempty: noempty}
+		atomic.StoreInt32(&w.newTxs, 0)
+	}
+
+	for {
+		select {
+		case <-timer.C:
+			log.Info("定时发送可以挖矿的信号 ... ", "Dops 可以挖矿", " Send Signal")
+			commit(false, commitInterruptNewHead)
+
+			//w.newWorkCh <- &newWorkReq{interrupt: interrupt, noempty: false}
+			timer.Reset(defaultDur)
+		}
+	}
+}
+
+
 // newWorkLoop is a standalone goroutine to submit new mining work upon received events.
 func (w *worker) newWorkLoop(recommit time.Duration) {
+	log.Info("进入 newWorkLoop() 函数，这个函数在适当的时候，告诉后面的人，可以挖矿了。仅仅是告诉别人可以挖矿的信号。")
 	var (
 		interrupt   *int32
 		minRecommit = recommit // minimal resubmit interval specified by user.
@@ -321,14 +359,34 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 	for {
 		select {
 		case <-w.startCh:
-			commit(false, commitInterruptNewHead)
+			log.Info("newWorkLoop() 函数中，startCh 管道中有消息，提交新的挖矿任务")
+			go func() {
+				var (
+					defaultDur          = 2 * time.Second
+					timer               = time.NewTimer(defaultDur)
+				)
+				for {
+					select {
+					case <-timer.C:
+						log.Info("定时发送可以挖矿的信号 ... ", "可以挖矿", "")
+						//commit(false, commitInterruptNewHead)
+						//atomic.StoreInt32(&w.running, 1)
+						w.newWorkCh <- &newWorkReq{interrupt: interrupt, noempty: false}
+						timer.Reset(defaultDur)
+					}
+				}
+			}()
+			//commit(false, commitInterruptNewHead)
 
 		case <-w.chainHeadCh:
-			commit(false, commitInterruptNewHead)
+			log.Info("newWorkLoop() 函数中，chainHeadCh 管道中有消息，代表有新块产生，重新提交新的挖矿任务")
+			//commit(false, commitInterruptNewHead)
 
 		case <-timer.C:
+			log.Info("newWorkLoop() 函数中，定时执行？")
 			// If mining is running resubmit a new work cycle periodically to pull in
 			// higher priced transactions. Disable this overhead for pending blocks.
+			// TODO 针对 POA 的逻辑？
 			if w.isRunning() && (w.config.Clique == nil || w.config.Clique.Period > 0) {
 				// Short circuit if no new transaction arrives.
 				if atomic.LoadInt32(&w.newTxs) == 0 {
@@ -339,6 +397,7 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 			}
 
 		case interval := <-w.resubmitIntervalCh:
+			log.Info("newWorkLoop() 函数中，不理解，interval")
 			// Adjust resubmit interval explicitly by user.
 			if interval < minRecommitInterval {
 				log.Warn("Sanitizing miner recommit interval", "provided", interval, "updated", minRecommitInterval)
@@ -352,6 +411,7 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 			}
 
 		case adjust := <-w.resubmitAdjustCh:
+			log.Info("newWorkLoop() 函数中，不理解，adjust")
 			// Adjust resubmit interval by feedback.
 			if adjust.inc {
 				before := recommit
@@ -375,6 +435,7 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 
 // mainLoop is a standalone goroutine to regenerate the sealing task based on the received event.
 func (w *worker) mainLoop() {
+	log.Info("进入 mainLoop() 函数")
 	defer w.txsSub.Unsubscribe()
 	defer w.chainHeadSub.Unsubscribe()
 	defer w.chainSideSub.Unsubscribe()
@@ -382,9 +443,25 @@ func (w *worker) mainLoop() {
 	for {
 		select {
 		case req := <-w.newWorkCh:
+			log.Info("mainLoop() 监听新挖矿任务消息管道，代表新的挖矿任务到来。将执行commitNewWork()方法")
+			engine, ok := w.engine.(*dpos.Dpos)
+			if !ok {
+				return
+			}
+			now := time.Now().Unix()
+			err := engine.CheckValidator(w.chain.CurrentBlock(), now)
+			if err != nil {
+				log.Info("不应该我出块，跳过", "now", now)
+				return
+			} else {
+				log.Info("该我出块", "now", now)
+			}
 			w.commitNewWork(req.interrupt, req.noempty)
 
 		case ev := <-w.chainSideCh:
+			log.Info("mainLoop() 监听叔块消息管道，在 Dpos 中，叔块逻辑应该不会调用")
+			jsonLog, _ := json.Marshal(ev)
+			log.Info("mainLoop ignore ChainSideEvent, ev: ", "event context: ", string(jsonLog))
 			if _, exist := w.possibleUncles[ev.Block.Hash()]; exist {
 				continue
 			}
@@ -413,6 +490,7 @@ func (w *worker) mainLoop() {
 			}
 
 		case ev := <-w.txsCh:
+			log.Info("mainLoop() 监听交易消息管道")
 			// Apply transactions to the pending state if we're not mining.
 			//
 			// Note all transactions received may not be continuous with transactions
@@ -434,6 +512,7 @@ func (w *worker) mainLoop() {
 			} else {
 				// If we're mining, but nothing is being processed, wake on new transactions
 				if w.config.Clique != nil && w.config.Clique.Period == 0 {
+					log.Info("这里应该不会调用,在使用 Dpos 的时候")
 					w.commitNewWork(nil, false)
 				}
 			}
@@ -462,7 +541,7 @@ func (w *worker) seal(t *task, stop <-chan struct{}) {
 	if w.skipSealHook != nil && w.skipSealHook(t) {
 		return
 	}
-
+	log.Info("开始调用共识Engine")
 	if t.block, err = w.engine.Seal(w.chain, t.block, stop); t.block != nil {
 		log.Info("Successfully sealed new block", "number", t.block.Number(), "hash", t.block.Hash(),
 			"elapsed", common.PrettyDuration(time.Since(t.createdAt)))
@@ -497,6 +576,7 @@ func (w *worker) taskLoop() {
 	for {
 		select {
 		case task := <-w.taskCh:
+			log.Info("taskLoop() ", "从 taskCh 中收到提交的挖矿任务，现在需要做的是共识", "")
 			if w.newTaskHook != nil {
 				w.newTaskHook(task)
 			}
@@ -521,6 +601,7 @@ func (w *worker) resultLoop() {
 	for {
 		select {
 		case result := <-w.resultCh:
+			log.Info("从 resultCh 中拿出已经 Seal 过的区块", "共识完成之后的处理，存本地和广播", "")
 			// Short circuit when receiving empty result.
 			if result == nil {
 				continue
@@ -779,6 +860,7 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool) {
 	defer w.mu.RUnlock()
 
 	tstart := time.Now()
+	log.Info("commitNewWork() 开始时间", "now: ", tstart)
 	parent := w.chain.CurrentBlock()
 
 	tstamp := tstart.Unix()
@@ -914,6 +996,7 @@ func (w *worker) commit(uncles []*types.Header, interval func(), update bool, st
 	if err != nil {
 		return err
 	}
+	log.Info("判定是否提交共识任务 ", "isRunning", w.isRunning())
 	if w.isRunning() {
 		if interval != nil {
 			interval()

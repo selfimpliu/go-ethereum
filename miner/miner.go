@@ -53,6 +53,7 @@ type Miner struct {
 }
 
 func New(eth Backend, config *params.ChainConfig, mux *event.TypeMux, engine consensus.Engine, recommit time.Duration) *Miner {
+	log.Info("miner.New()")
 	miner := &Miner{
 		eth:      eth,
 		mux:      mux,
@@ -82,6 +83,7 @@ func (self *Miner) update() {
 			}
 			switch ev.Data.(type) {
 			case downloader.StartEvent:
+				log.Info("收到事件", "downloader.StartEvent", "")
 				atomic.StoreInt32(&self.canStart, 0)
 				if self.Mining() {
 					self.Stop()
@@ -89,11 +91,13 @@ func (self *Miner) update() {
 					log.Info("Mining aborted due to sync")
 				}
 			case downloader.DoneEvent, downloader.FailedEvent:
+				log.Info("收到事件", "downloader.DoneEvent, downloader.FailedEvent", "")
 				shouldStart := atomic.LoadInt32(&self.shouldStart) == 1
 
 				atomic.StoreInt32(&self.canStart, 1)
 				atomic.StoreInt32(&self.shouldStart, 0)
 				if shouldStart {
+					log.Info("收到事件后，根据 shouldStart 判断后，开始挖矿")
 					self.Start(self.coinbase)
 				}
 				// stop immediately and ignore all further pending events
@@ -106,6 +110,7 @@ func (self *Miner) update() {
 }
 
 func (self *Miner) Start(coinbase common.Address) {
+	log.Info("调用 work.Start() 方法")
 	atomic.StoreInt32(&self.shouldStart, 1)
 	self.SetEtherbase(coinbase)
 
@@ -113,6 +118,7 @@ func (self *Miner) Start(coinbase common.Address) {
 		log.Info("Network syncing, will start miner afterwards")
 		return
 	}
+	log.Info("调用 work.Start() 方法，启动共识 worker ")
 	self.worker.start()
 }
 
